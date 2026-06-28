@@ -264,6 +264,13 @@ function initPegs(n){
       pegs.push({player:p,peg_index:i,position:{zone:"start",pegSlot:i},hasLooped:false});
   return pegs;
 }
+function normalizeDbPeg(peg){
+  const position=peg.position||{zone:"start",pegSlot:peg.peg_index||0};
+  const hasLooped=peg.hasLooped??position.hasLooped??false;
+  const cleanPosition={...position};
+  delete cleanPosition.hasLooped;
+  return {...peg,position:cleanPosition,hasLooped};
+}
 
 function getValidMoves(peg,card,allPegs,n){
   const{rank}=card;
@@ -755,8 +762,11 @@ function LobbyScreen({roomId,playerName,onStart,onUpdate,onBack,onRules}){
   const[players,setPlayers]=useState([]);
   const[myIndex,setMyIndex]=useState(null);
   const[loading,setLoading]=useState(true);
+  const[err,setErr]=useState("");
+  const[starting,setStarting]=useState(false);
   const[numPlayers,setNumPlayers]=useState(4);
   const joined=useRef(false);
+  const startingRef=useRef(false);
 
   useEffect(()=>{
     if(joined.current) return;
@@ -765,26 +775,41 @@ function LobbyScreen({roomId,playerName,onStart,onUpdate,onBack,onRules}){
   },[]);
 
   async function joinRoom(){
-    // Get current players
-    const{data:existing}=await supabase.from("players").select("*").eq("room_id",roomId);
-    const idx=existing?.length||0;
-    setMyIndex(idx);
+    setErr("");
+    const{data:r,error:roomError}=await supabase.from("rooms").select("*").eq("id",roomId).single();
+    if(roomError||!r){ setErr("Room not found"); setLoading(false); return; }
+    if(r.status==="playing"){ setErr("Game already started"); setLoading(false); return; }
 
-    // Insert self
-    await supabase.from("players").insert({
-      room_id:roomId,player_index:idx,name:playerName,color:COLORS[idx].track,is_connected:true
-    });
+    const{data:existing,error:playersError}=await supabase
+      .from("players").select("*").eq("room_id",roomId).order("player_index");
+    if(playersError){ setErr("Could not load players"); setLoading(false); return; }
 
-    // Fetch room
-    const{data:r}=await supabase.from("rooms").select("*").eq("id",roomId).single();
-    setRoom(r);
-    setNumPlayers(r?.num_players||4);
+    const normalizedName=playerName.trim().toLowerCase();
+    const returning=(existing||[]).find(p=>(p.name||"").trim().toLowerCase()===normalizedName);
+    let idx=returning?.player_index;
+    if(returning){
+      await supabase.from("players").update({is_connected:true}).eq("id",returning.id);
+    }else{
+      const openIndex=Array.from({length:r.num_players},(_,i)=>i)
+        .find(i=>!(existing||[]).some(p=>p.player_index===i));
+      if(openIndex===undefined){
+        setErr("Room is full");
+        setLoading(false);
+        return;
+      }
+      idx=openIndex;
+      const{error:insertError}=await supabase.from("players").insert({
+        room_id:roomId,player_index:idx,name:playerName,color:COLORS[idx].track,is_connected:true
+      });
+      if(insertError){ setErr("Could not join room"); setLoading(false); return; }
+    }
 
-    // Fetch updated players
     const{data:ps}=await supabase.from("players").select("*").eq("room_id",roomId).order("player_index");
+    setMyIndex(idx);
+    setRoom(r);
+    setNumPlayers(r.num_players||4);
     setPlayers(ps||[]);
     setLoading(false);
-
     onUpdate({myIndex:idx,players:ps||[]});
   }
 
@@ -799,35 +824,58 @@ function LobbyScreen({roomId,playerName,onStart,onUpdate,onBack,onRules}){
         })
       .on("postgres_changes",{event:"UPDATE",schema:"public",table:"rooms",filter:`id=eq.${roomId}`},
         async (payload)=>{
-          if(payload.new.status==="playing") onStart(payload.new,players,myIndex);
+          setRoom(payload.new);
+          setNumPlayers(payload.new.num_players||numPlayers);
+          if(payload.new.status==="playing"){
+            const{data:ps}=await supabase.from("players").select("*").eq("room_id",roomId).order("player_index");
+            onStart(payload.new,ps||players,myIndex);
+          }
         })
       .subscribe();
     return ()=>supabase.removeChannel(ch);
-  },[roomId,myIndex]);
+  },[roomId,myIndex,players,numPlayers]);
 
   async function handleStart(){
+    if(startingRef.current) return;
+    startingRef.current=true;
+    setStarting(true);
+    setErr("");
+    const{data:freshPlayers,error:playersError}=await supabase
+      .from("players").select("*").eq("room_id",roomId).order("player_index");
+    if(playersError||!freshPlayers){ setErr("Could not load players"); startingRef.current=false; setStarting(false); return; }
+    if(freshPlayers.length!==numPlayers){
+      setErr(`Need exactly ${numPlayers} players to start`);
+      startingRef.current=false;
+      setStarting(false);
+      return;
+    }
+
     const deck=shuffle(createDeck());
     const pegs=initPegs(numPlayers);
 
-    // Update room
-    await supabase.from("rooms").update({
+    await supabase.from("pegs").delete().eq("room_id",roomId);
+    const{error:pegError}=await supabase.from("pegs").insert(pegs.map(peg=>({
+      room_id:roomId,player_index:peg.player,peg_index:peg.peg_index,
+      position:{...peg.position,hasLooped:false}
+    })));
+    if(pegError){ setErr("Could not set up pegs"); startingRef.current=false; setStarting(false); return; }
+
+    const{error:roomError}=await supabase.from("rooms").update({
       status:"playing",num_players:numPlayers,current_player:0,
       deck,discard:[],drawn_card:null
-    }).eq("id",roomId);
-
-    // Insert pegs
-    for(const peg of pegs){
-      await supabase.from("pegs").insert({
-        room_id:roomId,player_index:peg.player,peg_index:peg.peg_index,
-        position:peg.position
-      });
-    }
+    }).eq("id",roomId).eq("status","waiting");
+    if(roomError){ setErr("Could not start game"); startingRef.current=false; setStarting(false); return; }
 
     const{data:updRoom}=await supabase.from("rooms").select("*").eq("id",roomId).single();
-    onStart(updRoom,players,myIndex);
+    onStart(updRoom,freshPlayers,myIndex);
   }
 
   async function updateNumPlayers(n){
+    if(n<players.length){
+      setErr(`Already have ${players.length} players`);
+      return;
+    }
+    setErr("");
     setNumPlayers(n);
     await supabase.from("rooms").update({num_players:n}).eq("id",roomId);
   }
@@ -837,7 +885,12 @@ function LobbyScreen({roomId,playerName,onStart,onUpdate,onBack,onRules}){
       justifyContent:"center",color:"white",fontFamily:"Arial"}}>
       <div style={{textAlign:"center"}}>
         <div style={{fontSize:24,marginBottom:8}}>⏳</div>
-        <div>Joining room...</div>
+        <div>{err||"Joining room..."}</div>
+        {err&&<button onClick={onBack}
+          style={{marginTop:14,background:"#C8A951",border:"none",borderRadius:8,
+            color:"#061126",fontWeight:900,padding:"9px 14px",cursor:"pointer"}}>
+          Back
+        </button>}
       </div>
     </div>
   );
@@ -915,12 +968,15 @@ function LobbyScreen({roomId,playerName,onStart,onUpdate,onBack,onRules}){
       </div>
 
       {isHost?(
-        <button onClick={handleStart} disabled={players.length<2}
-          style={{padding:"14px 40px",background:players.length>=2?"#C8A951":"#333",
-            border:"none",borderRadius:10,color:players.length>=2?"#060E1E":"#666",
-            fontWeight:900,fontSize:15,cursor:players.length>=2?"pointer":"default"}}>
-          {players.length>=2?"🎮 Start Game":"Waiting for players..."}
-        </button>
+        <>
+          <button onClick={handleStart} disabled={players.length!==numPlayers||starting}
+            style={{padding:"14px 40px",background:players.length===numPlayers&&!starting?"#C8A951":"#333",
+              border:"none",borderRadius:10,color:players.length===numPlayers&&!starting?"#060E1E":"#666",
+              fontWeight:900,fontSize:15,cursor:players.length===numPlayers&&!starting?"pointer":"default"}}>
+            {starting?"Starting...":players.length===numPlayers?"🎮 Start Game":`Need ${numPlayers-players.length} more`}
+          </button>
+          {err&&<div style={{color:"#FF6B6B",textAlign:"center",marginTop:10,fontSize:12}}>{err}</div>}
+        </>
       ):(
         <div style={{textAlign:"center",color:"#7AAEE8",fontSize:12}}>
           ⏳ Waiting for host to start...
@@ -958,12 +1014,15 @@ function GameScreen({roomId,myIndex,numPlayers,initialRoom,isLocal,onBack,onRule
       setLoading(false);
       return;
     }
-    const[{data:ps},{data:pg},{data:pl}]=await Promise.all([
-      supabase.from("pegs").select("*").eq("room_id",roomId),
+    const[{data:pg},{data:pl}]=await Promise.all([
       supabase.from("pegs").select("*").eq("room_id",roomId),
       supabase.from("players").select("*").eq("room_id",roomId).order("player_index"),
     ]);
-    setPegs(ps||[]);
+    if((pg||[]).length<numPlayers*4){
+      setTimeout(fetchAll,500);
+      return;
+    }
+    setPegs((pg||[]).map(normalizeDbPeg));
     setPlayers(pl||[]);
     setLoading(false);
   }
@@ -975,7 +1034,7 @@ function GameScreen({roomId,myIndex,numPlayers,initialRoom,isLocal,onBack,onRule
       .on("postgres_changes",{event:"UPDATE",schema:"public",table:"rooms",filter:`id=eq.${roomId}`},
         payload=>{ setRoom(payload.new); setSelectedPeg(null); setValidMoves([]); })
       .on("postgres_changes",{event:"*",schema:"public",table:"pegs",filter:`room_id=eq.${roomId}`},
-        async ()=>{ const{data}=await supabase.from("pegs").select("*").eq("room_id",roomId); setPegs(data||[]); })
+        async ()=>{ const{data}=await supabase.from("pegs").select("*").eq("room_id",roomId); setPegs((data||[]).map(normalizeDbPeg)); })
       .subscribe();
     return ()=>supabase.removeChannel(ch);
   },[roomId,isLocal]);
@@ -996,6 +1055,10 @@ function GameScreen({roomId,myIndex,numPlayers,initialRoom,isLocal,onBack,onRule
     let deck=readCards(room.deck);
     let discard=readCards(room.discard);
     if(deck.length===0){ deck=shuffle(discard); discard=[]; }
+    if(deck.length===0){
+      setMsg("No cards available. Return to the lobby and start a new game.");
+      return;
+    }
     const card=deck[0];
     const rest=deck.slice(1);
 
@@ -1053,8 +1116,7 @@ function GameScreen({roomId,myIndex,numPlayers,initialRoom,isLocal,onBack,onRule
         )));
       }else if(posChanged||loopChanged){
         await supabase.from("pegs").update({
-          position:updPeg.position,
-          hasLooped:updPeg.hasLooped||false
+          position:{...updPeg.position,hasLooped:updPeg.hasLooped||false}
         }).eq("room_id",roomId).eq("player_index",updPeg.player).eq("peg_index",updPeg.peg_index);
       }
     }
